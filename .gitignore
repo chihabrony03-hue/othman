@@ -1,0 +1,26 @@
+# secrets
+.env
+*.env
+!.env.example
+!**/meev.env.example
+
+# build artifacts
+frontend/node_modules/
+frontend/dist/
+backend/target/
+backend/static/
+release/
+dist/
+*.zip
+*.tar.gz
+*.log
+
+# uploads / media
+uploads/
+backend/uploads/
+
+# misc
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

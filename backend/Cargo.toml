@@ -1,0 +1,39 @@
+[package]
+name = "meev-backend"
+version = "1.0.0"
+edition = "2021"
+description = "MEEV - secure chat & social messenger backend (Rust/Axum/PostgreSQL/MQTT)"
+license = "MIT"
+default-run = "meev-backend"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs", "compression-gzip", "catch-panic", "request-id"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
+argon2 = "0.5"
+jsonwebtoken = "9"
+dotenvy = "0.15"
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release.package."*"]
+opt-level = 3
