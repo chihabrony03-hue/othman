@@ -1,0 +1,111 @@
+name: MEEV Build & Release
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build frontend + Rust backend + smoke test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: meev
+          POSTGRES_PASSWORD: meevpass_Test1
+          POSTGRES_DB: meev
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U meev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://meev:meevpass_Test1@localhost:5432/meev
+      JWT_SECRET: ci_smoke_test_secret_0123456789_0123456789_0123456789
+      RUST_BACKTRACE: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------- Frontend ----------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build frontend (many small chunks)
+        run: npm run build
+        working-directory: frontend
+        env:
+          CI: 'true'
+
+      - name: Stage frontend for the backend
+        run: cp -r frontend/dist backend/static
+
+      # ---------------- Backend ----------------
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Add RUSTFLAGS (faster CI binary)
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64" >> $GITHUB_ENV
+
+      - name: Build backend (release)
+        run: cargo build --release
+        working-directory: backend
+
+      # ---------------- Live smoke test ----------------
+      - name: Install ffmpeg + mosquitto
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg mosquitto mosquitto-clients
+
+      - name: Start local MQTT broker
+        run: |
+          sudo systemctl start mosquitto || (sudo mosquitto -d -p 1883)
+          sleep 1
+          mosquitto_pub -h localhost -t meev/ci -m up || true
+
+      - name: Run backend smoke test (API + DB + MQTT + uploads)
+        run: bash scripts/smoke.sh
+        env:
+          MQTT_URL: tcp://localhost:1883
+          MQTT_ENABLED: 'true'
+          APP_PORT: '8080'
+
+      # ---------------- Release artifact ----------------
+      - name: Assemble release package
+        run: |
+          set -euo pipefail
+          OUT=release/meev-linux-x86_64
+          mkdir -p "$OUT" release
+          cp backend/target/release/meev-backend "$OUT/"
+          cp -r backend/static "$OUT/static"
+          cp backend/.env.example "$OUT/meev.env.example"
+          cp scripts/start.sh scripts/gen-env.sh "$OUT/"
+          chmod +x "$OUT/start.sh" "$OUT/gen-env.sh" "$OUT/meev-backend"
+          cp README.md "$OUT/README.md"
+          (cd release && zip -qr MEEV-release-linux-x86_64.zip meev-linux-x86_64)
+          ls -lh release/
+
+      - name: Upload release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: MEEV-release-linux-x86_64
+          path: release/MEEV-release-linux-x86_64.zip
+          if-no-files-found: error
