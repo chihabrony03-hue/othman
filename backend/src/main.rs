@@ -18,20 +18,14 @@ mod routes;
 mod state;
 mod suggest;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::header;
-use axum::http::{HeaderValue, Method};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, OriginalUri, Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::fs::{ServeDir, ServeFile};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use serde_json::json;
 
 use crate::config::Config;
 use crate::mqtt::MqttHandle;
@@ -95,7 +89,10 @@ fn bind_addr_from(state: &AppState) -> std::net::SocketAddr {
     state.cfg.bind_addr()
 }
 
-/// Security headers + request logging, applied to every response.
+// ---------------------------------------------------------------------------
+// Middleware (small hand-rolled layers; no heavy HTTP stack)
+// ---------------------------------------------------------------------------
+
 async fn security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
@@ -107,6 +104,47 @@ async fn security_headers(req: Request, next: Next) -> Response {
         "permissions-policy",
         HeaderValue::from_static("camera=(self), microphone=(self), geolocation=(self)"),
     );
+    resp
+}
+
+fn apply_cors(cfg: &Config, origin: Option<&str>, resp: &mut Response) {
+    let allowed = cfg.cors_origins.iter().any(|o| o == "*")
+        || origin.is_some_and(|o| cfg.cors_origins.iter().any(|c| c == o));
+    if let Some(o) = origin {
+        if allowed {
+            let h = resp.headers_mut();
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_str(o).unwrap_or_else(|_| HeaderValue::from_static("*")));
+            h.insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+            h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type, accept, origin"));
+            h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"));
+            h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("content-type, content-length, cache-control"));
+            h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        }
+    }
+}
+
+async fn cors_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|o| o.to_string());
+    if req.method() == Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        apply_cors(&state.cfg, origin.as_deref(), &mut resp);
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    apply_cors(&state.cfg, origin.as_deref(), &mut resp);
+    resp
+}
+
+async fn logging_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!("{method} {path} -> {} ({}ms)", resp.status(), started.elapsed().as_millis());
     resp
 }
 
@@ -124,36 +162,67 @@ async fn rate_limit_middleware(State(state): State<AppState>, req: Request, next
         Ok(()) => next.run(req).await,
         Err(after) => {
             tracing::warn!("rate limited: {key} for {after}s");
-            let mut resp = (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limit").into_response();
+            let mut resp: Response = StatusCode::TOO_MANY_REQUESTS.into_response();
             resp.headers_mut().insert("retry-after", after.to_string().parse().unwrap_or("60".parse().unwrap()));
             resp
         }
     }
 }
 
-fn cors_layer(cfg: &Config) -> CorsLayer {
-    let mut layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::ACCEPT,
-            header::ORIGIN,
-        ])
-        .expose_headers([header::CONTENT_TYPE, header::CONTENT_LENGTH, header::CACHE_CONTROL])
-        .max_age(std::time::Duration::from_secs(86400));
-    if cfg.cors_origins.iter().any(|o| o == "*") {
-        layer = layer.allow_origin(Any);
+// ---------------------------------------------------------------------------
+// Static frontend serving (SPA) — security-aware, cache-friendly.
+// ---------------------------------------------------------------------------
+
+async fn static_file(state: &AppState, rel: &str) -> Response {
+    let root = &state.cfg.static_dir;
+    let rel = rel.trim_start_matches('/');
+    let path = if rel.is_empty() {
+        root.join("index.html")
     } else {
-        let origins: Vec<HeaderValue> = cfg
-            .cors_origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
-        layer = layer.allow_origin(origins);
+        root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
+    };
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return StatusCode::FORBIDDEN.into_response();
     }
-    layer
+    let meta = tokio::fs::metadata(&path).await;
+    let (file_path, is_asset) = match meta {
+        Ok(m) if m.is_file() => {
+            let is_asset = path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("/assets/");
+            (path, is_asset)
+        }
+        _ => {
+            // SPA fallback: serve index.html for client-side routes.
+            (root.join("index.html"), false)
+        }
+    };
+    let Ok(bytes) = tokio::fs::read(&file_path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+    let mut resp = Response::new(Body::from(bytes));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.essence_str()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")));
+    h.insert(
+        header::CACHE_CONTROL,
+        if is_asset {
+            HeaderValue::from_static("public, max-age=31536000, immutable")
+        } else {
+            HeaderValue::from_static("no-cache")
+        },
+    );
+    resp
 }
+
+pub async fn spa_fallback(State(state): State<AppState>, uri: OriginalUri) -> Response {
+    static_file(&state, uri.path()).await
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
 
 fn build_router(state: AppState) -> Router {
     let cfg = state.cfg.clone();
@@ -195,23 +264,15 @@ fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state.clone());
 
-    let serve_dir = ServeDir::new(&cfg.static_dir)
-        .not_found_service(ServeFile::new(cfg.static_dir.join("index.html")));
+    let fallback = Router::new().fallback(get(spa_fallback)).with_state(state.clone());
 
     Router::new()
         .merge(api)
-        .fallback_service(serve_dir)
-        .layer(axum::middleware::from_fn(security_headers))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
-        .layer(CompressionLayer::new())
-        .layer(SetRequestIdLayer::new(
-            header::HeaderName::from_static("x-request-id"),
-            MakeRequestUuid,
-        ))
-        .layer(PropagateRequestIdLayer::new(header::HeaderName::from_static("x-request-id")))
-        .layer(CatchPanicLayer::new())
-        .layer(cors_layer(&cfg))
-        .layer(TraceLayer::new_for_http())
+        .fallback_service(fallback)
+        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(logging_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), cors_middleware))
+        .layer(middleware::from_fn_with_state(state, rate_limit_middleware))
 }
 
 pub async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
@@ -219,7 +280,7 @@ pub async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Val
         .fetch_one(&state.pool)
         .await
         .is_ok();
-    axum::Json(serde_json::json!({
+    axum::Json(json!({
         "status": if db_ok { "ok" } else { "degraded" },
         "service": "meev-backend",
         "version": env!("CARGO_PKG_VERSION"),
