@@ -371,9 +371,8 @@ pub async fn send_message(
     let message = load_message(&state, msg_id).await?;
 
     // Deliver over MQTT (message bus) + local sockets. The MQTT bridge dedups
-    // the broker echo because we mark the topic as locally-originated.
-    let topic = format!("meev/{conv_id}/messages");
-    state.mark_local_event(&topic).await;
+    // the broker echo per message id, so local clients are not double-fed.
+    state.mark_local_event(&format!("msg:{msg_id}")).await;
     state.mqtt.publish_message(&message);
     let data = serde_json::to_value(&message).unwrap_or_default();
     state.hub.broadcast_room(conv_id, "message", data).await;
@@ -398,7 +397,6 @@ pub async fn mark_read(
     .await?;
 
     let ev = ReadEvent { conversation_id: conv_id, user_id: user.user_id, read_at: now };
-    state.mark_local_event(&format!("meev/{conv_id}/read")).await;
     state.hub.broadcast_room(conv_id, "read", serde_json::to_value(&ev).unwrap_or_default()).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -409,8 +407,6 @@ pub async fn typing(
     Path(conv_id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
     ensure_member(&state, conv_id, user.user_id).await?;
-    let topic = format!("meev/{conv_id}/typing");
-    state.mark_local_event(&topic).await;
     state.mqtt.publish_typing(conv_id, user.user_id);
     let ev = crate::models::TypingEvent { conversation_id: conv_id, user_id: user.user_id };
     state.hub.broadcast_room(conv_id, "typing", serde_json::to_value(&ev).unwrap_or_default()).await;

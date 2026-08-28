@@ -68,7 +68,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, user: AuthedUser)
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        let txt = text.to_string();
+                        let txt = text.as_str().to_string();
                         if let Ok(parsed) = serde_json::from_str::<ClientMsg>(&txt) {
                             match parsed {
                                 ClientMsg::Init { rooms } => {
@@ -96,7 +96,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, user: AuthedUser)
                         }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(Message::Ping(_))) => { let _ = socket.send(Message::Pong(vec![])).await; }
+                    Some(Ok(Message::Ping(_))) => {
+                        let _ = socket.send(Message::Pong(axum::body::Bytes::new())).await;
+                    }
                     _ => {}
                 }
             }

@@ -118,9 +118,25 @@ pub async fn file(
     Query(q): Query<FileQuery>,
 ) -> AppResult<Response> {
     let _ = q;
+    // Access control: the owner may always fetch; otherwise the attachment must
+    // already be attached to a message in a conversation the requester belongs to.
     let row = sqlx::query(
-        "SELECT stored_rel, mime_type, original_name, (message_id IS NOT NULL AND owner_id <> $2) AS foreign_msg
-         FROM attachments WHERE id = $1",
+        r#"
+        SELECT a.stored_rel, a.mime_type, a.original_name
+        FROM attachments a
+        WHERE a.id = $1
+          AND (
+            a.owner_id = $2
+            OR (
+              a.message_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM messages m
+                JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+                WHERE m.id = a.message_id AND cm.user_id = $2
+              )
+            )
+          )
+        "#,
     )
     .bind(id)
     .bind(user.user_id)
@@ -142,10 +158,27 @@ pub async fn thumb(
     user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Response> {
-    let row = sqlx::query("SELECT thumb_rel FROM attachments WHERE id = $1 AND thumb_rel IS NOT NULL")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?;
+    let row = sqlx::query(
+        r#"
+        SELECT a.stored_rel FROM attachments a
+        WHERE a.id = $1 AND a.thumb_rel IS NOT NULL
+          AND (
+            a.owner_id = $2
+            OR (
+              a.message_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM messages m
+                JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+                WHERE m.id = a.message_id AND cm.user_id = $2
+              )
+            )
+          )
+        "#,
+    )
+    .bind(id)
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await?;
     let Some(row) = row else {
         return Err(AppError::NotFound("الصورة المصغرة غير موجودة.".into()));
     };

@@ -128,9 +128,7 @@ pub fn start(state: AppState) -> MqttHandle {
                     let st = state.clone();
                     tokio::spawn(async move { handle_topic(&st, &topic, &payload).await });
                 }
-                Ok(Event::Incoming(other)) => {
-                    tracing::trace!("mqtt incoming: {other:?}");
-                }
+                Ok(Event::Incoming(_other)) => {}
                 Ok(Event::Outgoing(_)) => {}
                 Err(e) => {
                     if h2.connected.swap(false, Ordering::Relaxed) {
@@ -156,18 +154,18 @@ async fn handle_topic(state: &AppState, topic: &str, payload: &[u8]) {
         return;
     }
 
-    // Dedup: events we originate locally (REST handlers) are already delivered
-    // to local sockets, so ignore the broker echo.
-    if !state.dedup.see(topic).await {
-        return;
-    }
-
     match kind {
         "messages" => {
             let msg: MessageOut = match serde_json::from_slice(payload) {
                 Ok(m) => m,
                 Err(_) => return,
             };
+            // Dedup per message id: events published by this instance (REST
+            // handlers) are already delivered to local sockets, so the broker
+            // echo must be ignored — but messages from other instances pass.
+            if !state.dedup.see(&format!("msg:{}", msg.id)).await {
+                return;
+            }
             // Validate the sender is a member of the conversation before fanning out.
             let is_member: Option<bool> = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2)",

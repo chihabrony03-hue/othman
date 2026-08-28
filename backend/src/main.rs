@@ -72,6 +72,7 @@ async fn main() {
     let addr = bind_addr_from(&state);
     let app = build_router(state);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
+
         Ok(l) => l,
         Err(e) => {
             tracing::error!("cannot bind {addr}: {e}");
@@ -225,10 +226,9 @@ pub async fn spa_fallback(State(state): State<AppState>, uri: OriginalUri) -> Re
 // ---------------------------------------------------------------------------
 
 fn build_router(state: AppState) -> Router {
-    let cfg = state.cfg.clone();
-    let max_body = cfg.max_upload_bytes + 1024 * 1024;
+    let max_body = state.cfg.max_upload_bytes + 1024 * 1024;
 
-    let api = Router::new()
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/register", post(routes::auth::register))
         .route("/api/auth/login", post(routes::auth::login))
@@ -261,18 +261,13 @@ fn build_router(state: AppState) -> Router {
         .route("/api/media/:id/file", get(routes::media::file))
         .route("/api/media/:id/thumb", get(routes::media::thumb))
         .route("/ws", get(routes::ws::ws_handler))
+        .fallback(get(spa_fallback))
         .layer(DefaultBodyLimit::max(max_body))
-        .with_state(state.clone());
-
-    let fallback = Router::new().fallback(get(spa_fallback)).with_state(state.clone());
-
-    Router::new()
-        .merge(api)
-        .fallback_service(fallback)
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(logging_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), cors_middleware))
-        .layer(middleware::from_fn_with_state(state, rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .with_state(state)
 }
 
 pub async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> {

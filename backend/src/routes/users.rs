@@ -462,7 +462,6 @@ pub async fn follow_user(
 
     // Notify the target via their sockets.
     state.hub.broadcast_user(target_id, "follow", json!({ "by": user.user_id, "status": status })).await;
-    state.mqtt.publish_presence(user.user_id, true);
     Ok(Json(json!({ "status": status })))
 }
 

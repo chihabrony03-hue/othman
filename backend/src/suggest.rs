@@ -73,9 +73,10 @@ pub async fn suggestions(pool: &PgPool, me: Uuid, limit: usize) -> AppResult<Vec
     .bind(me)
     .fetch_optional(pool)
     .await?
-    .flatten()
-    .filter(|(lat, lng)| lat.is_some() && lng.is_some())
-    .map(|(lat, lng)| (lat.unwrap(), lng.unwrap()));
+    .and_then(|(lat, lng)| match (lat, lng) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    });
 
     // Candidate pool — excludes self, existing accepted follows, and blocks.
     let candidates: Vec<Candidate> = sqlx::query_as(
