@@ -24,3 +24,7 @@ backend/uploads/
 Thumbs.db
 .idea/
 .vscode/
+
+# offline vendored sources (never commit)
+backend/vendor/
+backend/.cargo/

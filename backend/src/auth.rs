@@ -82,13 +82,13 @@ pub fn create_access_token(cfg: &crate::config::Config, user_id: Uuid, username:
 
 pub async fn create_refresh_token(state: &AppState, user_id: Uuid) -> AppResult<String> {
     let now = Utc::now().timestamp() as usize;
-    let jti = Uuid::new_v4().to_string();
+    let jti = Uuid::new_v4();
     let claims = Claims {
         sub: user_id.to_string(),
         username: String::new(),
         iat: now,
         exp: now + state.cfg.jwt_refresh_ttl_secs as usize,
-        jti: Some(jti.clone()),
+        jti: Some(jti.to_string()),
     };
     let token = encode(
         &Header::new(Algorithm::HS512),
@@ -104,7 +104,7 @@ pub async fn create_refresh_token(state: &AppState, user_id: Uuid) -> AppResult<
         "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
          VALUES ($1, $2, $3, $4)",
     )
-    .bind(&jti)
+    .bind(jti)
     .bind(user_id)
     .bind(&token_hash)
     .bind(expires)
@@ -119,8 +119,9 @@ pub async fn rotate_refresh_token(state: &AppState, token: &str) -> AppResult<(U
     validation.leeway = 10;
     let data = decode::<Claims>(token, &DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes()), &validation)
         .map_err(|_| AppError::Unauthorized("الجلسة منتهية أو غير صالحة. سجل الدخول مجدداً.".into()))?;
-    let claims = data.claims;
+        let claims = data.claims;
     let jti = claims.jti.clone().ok_or_else(|| AppError::Unauthorized("رمز غير صالح.".into()))?;
+    let jti_uuid = Uuid::parse_str(&jti).map_err(|_| AppError::Unauthorized("رمز غير صالح.".into()))?;
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AppError::Unauthorized("رمز غير صالح.".into()))?;
     let token_hash = refresh_hash(token);
 
@@ -128,7 +129,7 @@ pub async fn rotate_refresh_token(state: &AppState, token: &str) -> AppResult<(U
     let result = sqlx::query(
         "DELETE FROM refresh_tokens WHERE id = $1 AND user_id = $2 AND token_hash = $3 AND expires_at > now()",
     )
-    .bind(&jti)
+    .bind(jti_uuid)
     .bind(user_id)
     .bind(&token_hash)
     .execute(&state.pool)
@@ -150,10 +151,12 @@ pub async fn revoke_refresh_token(state: &AppState, token: &str) {
     );
     if let Ok(data) = data {
         if let Some(jti) = data.claims.jti {
-            let _ = sqlx::query("DELETE FROM refresh_tokens WHERE id = $1")
-                .bind(jti)
-                .execute(&state.pool)
-                .await;
+            if let Ok(jti_uuid) = Uuid::parse_str(&jti) {
+                let _ = sqlx::query("DELETE FROM refresh_tokens WHERE id = $1")
+                    .bind(jti_uuid)
+                    .execute(&state.pool)
+                    .await;
+            }
         }
     }
 }
